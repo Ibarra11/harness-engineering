@@ -7,8 +7,17 @@ import { model } from "./model";
 import { tools, runTool } from "./tools";
 import { SYSTEM_PROMPT } from "./system-prompt";
 
-// A safety cap so a confused model can't loop forever.
-const MAX_STEPS = 10;
+import {
+  buildContext,
+  summarize,
+  estimateTokens,
+  MAX_CONTEXT_TOKENS,
+  KEEP_CONTEXT_TOKENS,
+} from "./memory";
+
+// A safety cap so a confused model can't loop forever. Higher than Lesson 1 now
+// that one task can span many items (and therefore many turns).
+const MAX_STEPS = 30;
 
 type ToolCall = {
   toolCallId: string;
@@ -26,9 +35,9 @@ type Turn = {
 // is checkpointed and never re-called — a crash won't re-bill the LLM.
 async function modelTurn(
   workflowId: string,
-  messages: ModelMessage[],
+  context: ModelMessage[],
 ): Promise<Turn> {
-  const result = streamText({ model, messages, tools });
+  const result = streamText({ model, messages: context, tools });
 
   for await (const part of result.fullStream) {
     if (part.type === "text-delta") {
@@ -72,7 +81,13 @@ async function toolStep(
   });
   return output;
 }
+// We keep the conversation as a list of TURNS. Each pass:
+//   1. if we have too many turns, compact the oldest into a running summary
+//   2. hydrate the context (system + task + summary + recent turns)
+//   3. run one model turn over THAT context — not the whole history
 
+// So the tokens we send stay roughly flat no matter how long the task runs. The
+// full history still lives, durably, in the Postgres event log.
 export async function agentWorkflow(opts: { input: string }): Promise<string> {
   const workflowId = DBOS.workflowID ?? "unknown";
   const { input } = opts;
@@ -81,20 +96,52 @@ export async function agentWorkflow(opts: { input: string }): Promise<string> {
     { name: "started" },
   );
 
-  // BRITTLE STATE: a plain in-memory array. If this process dies, it's gone.
-  const messages: ModelMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: input },
-  ];
+  const turns: ModelMessage[][] = [];
+  let summary = "";
 
   // THE LOOP. We drive it ourselves — each pass is exactly one model turn,
   // because streamText does a single generation by default.
   let step = 0;
   while (step < MAX_STEPS) {
-    const turn = await DBOS.runStep(() => modelTurn(workflowId, messages), {
+    // 1. Compact: while the recent window is over budget, peel the oldest turns
+    //    into the running summary (keeping at least the last turn verbatim).
+    if (estimateTokens(turns.flat()) > MAX_CONTEXT_TOKENS) {
+      const old: ModelMessage[][] = [];
+      while (
+        turns.length > 1 &&
+        estimateTokens(turns.flat()) > KEEP_CONTEXT_TOKENS
+      ) {
+        const oldest = turns.shift();
+        if (oldest) old.push(oldest);
+      }
+      if (old.length > 0) {
+        summary = await DBOS.runStep(() => summarize(old, summary), {
+          name: `summarize-${step}`,
+        });
+        const contextTokens = estimateTokens(
+          buildContext(input, summary, turns),
+        );
+        await DBOS.runStep(
+          () =>
+            emit({
+              type: EventType.MemoryCompacted,
+              workflowId,
+              summarizedTurns: old.length,
+              contextTokens,
+              summary,
+            }),
+          { name: `compacted-${step}` },
+        );
+      }
+    }
+
+    // 2 + 3. Hydrate the context and run one turn over it.
+    const context = buildContext(input, summary, turns);
+    const turn = await DBOS.runStep(() => modelTurn(workflowId, context), {
       name: `model-${step}`,
     });
-    messages.push(...turn.responseMessages);
+
+    const turnMessages: ModelMessage[] = [...turn.responseMessages];
     if (turn.toolCalls.length === 0) {
       await DBOS.runStep(
         () =>
@@ -118,7 +165,7 @@ export async function agentWorkflow(opts: { input: string }): Promise<string> {
         name: `tool-${call.toolCallId}`,
       });
       // Feed the tool result back to the model on the next turn.
-      messages.push({
+      turnMessages.push({
         role: "tool",
         content: [
           {
@@ -130,6 +177,7 @@ export async function agentWorkflow(opts: { input: string }): Promise<string> {
         ],
       });
     }
+    turns.push(turnMessages);
     step++;
   }
 
