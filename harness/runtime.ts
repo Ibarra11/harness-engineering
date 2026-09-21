@@ -1,11 +1,11 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import { emit } from "harness/bus";
-import type { ModelMessage, JSONValue } from "ai";
+import type { ModelMessage, JSONValue, ToolSet } from "ai";
 import { streamText } from "ai";
 import { EventType } from "@shared/events";
 import { model } from "./model";
-import { tools, runTool } from "./tools";
-import { SYSTEM_PROMPT } from "./system-prompt";
+import { runTool } from "./tools";
+import { agents, triageAgent } from "./agents";
 
 import {
   buildContext,
@@ -36,8 +36,9 @@ type Turn = {
 async function modelTurn(
   workflowId: string,
   context: ModelMessage[],
+  agentTools: ToolSet,
 ): Promise<Turn> {
-  const result = streamText({ model, messages: context, tools });
+  const result = streamText({ model, messages: context, tools: agentTools });
 
   for await (const part of result.fullStream) {
     if (part.type === "text-delta") {
@@ -56,6 +57,20 @@ async function modelTurn(
     responseMessages: (await result.response).messages,
   };
   ``;
+}
+
+function toolResultMessage(call: ToolCall, value: JSONValue): ModelMessage {
+  return {
+    role: "tool",
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        output: { type: "json", value },
+      },
+    ],
+  };
 }
 
 // Execute one tool. We run this as a DBOS step so its side effect (e.g.
@@ -81,13 +96,11 @@ async function toolStep(
   });
   return output;
 }
-// We keep the conversation as a list of TURNS. Each pass:
-//   1. if we have too many turns, compact the oldest into a running summary
-//   2. hydrate the context (system + task + summary + recent turns)
-//   3. run one model turn over THAT context — not the whole history
+// The loop is identical to before, with two additions:
+//   · it runs the CURRENT agent's prompt + tools (start: triage)
+//   · the `handoff` tool isn't executed — the harness intercepts it and SWITCHES
+//     the running agent, keeping the conversation. Control transfers laterally.
 
-// So the tokens we send stay roughly flat no matter how long the task runs. The
-// full history still lives, durably, in the Postgres event log.
 export async function agentWorkflow(opts: { input: string }): Promise<string> {
   const workflowId = DBOS.workflowID ?? "unknown";
   const { input } = opts;
@@ -95,6 +108,8 @@ export async function agentWorkflow(opts: { input: string }): Promise<string> {
     () => emit({ type: EventType.WorkflowStarted, workflowId, input }),
     { name: "started" },
   );
+
+  let currentAgent = triageAgent;
 
   const turns: ModelMessage[][] = [];
   let summary = "";
@@ -105,41 +120,49 @@ export async function agentWorkflow(opts: { input: string }): Promise<string> {
   while (step < MAX_STEPS) {
     // 1. Compact: while the recent window is over budget, peel the oldest turns
     //    into the running summary (keeping at least the last turn verbatim).
-    if (estimateTokens(turns.flat()) > MAX_CONTEXT_TOKENS) {
-      const old: ModelMessage[][] = [];
-      while (
-        turns.length > 1 &&
-        estimateTokens(turns.flat()) > KEEP_CONTEXT_TOKENS
-      ) {
-        const oldest = turns.shift();
-        if (oldest) old.push(oldest);
-      }
-      if (old.length > 0) {
-        summary = await DBOS.runStep(() => summarize(old, summary), {
-          name: `summarize-${step}`,
-        });
-        const contextTokens = estimateTokens(
-          buildContext(input, summary, turns),
-        );
-        await DBOS.runStep(
-          () =>
-            emit({
-              type: EventType.MemoryCompacted,
-              workflowId,
-              summarizedTurns: old.length,
-              contextTokens,
-              summary,
-            }),
-          { name: `compacted-${step}` },
-        );
-      }
-    }
+    // if (estimateTokens(turns.flat()) > MAX_CONTEXT_TOKENS) {
+    //   const old: ModelMessage[][] = [];
+    //   while (
+    //     turns.length > 1 &&
+    //     estimateTokens(turns.flat()) > KEEP_CONTEXT_TOKENS
+    //   ) {
+    //     const oldest = turns.shift();
+    //     if (oldest) old.push(oldest);
+    //   }
+    //   if (old.length > 0) {
+    //     summary = await DBOS.runStep(() => summarize(old, summary), {
+    //       name: `summarize-${step}`,
+    //     });
+    //     const contextTokens = estimateTokens(
+    //       buildContext(input, summary, turns, currentAgent.systemPrompt),
+    //     );
+    //     await DBOS.runStep(
+    //       () =>
+    //         emit({
+    //           type: EventType.MemoryCompacted,
+    //           workflowId,
+    //           summarizedTurns: old.length,
+    //           contextTokens,
+    //           summary,
+    //         }),
+    //       { name: `compacted-${step}` },
+    //     );
+    //   }
+    // }
 
     // 2 + 3. Hydrate the context and run one turn over it.
-    const context = buildContext(input, summary, turns);
-    const turn = await DBOS.runStep(() => modelTurn(workflowId, context), {
-      name: `model-${step}`,
-    });
+    const context = buildContext(
+      input,
+      summary,
+      turns,
+      currentAgent.systemPrompt,
+    );
+    const turn = await DBOS.runStep(
+      () => modelTurn(workflowId, context, currentAgent.tools),
+      {
+        name: `model-${step}`,
+      },
+    );
 
     const turnMessages: ModelMessage[] = [...turn.responseMessages];
     if (turn.toolCalls.length === 0) {
@@ -161,23 +184,39 @@ export async function agentWorkflow(opts: { input: string }): Promise<string> {
     }
 
     for (const call of turn.toolCalls) {
-      const output = await DBOS.runStep(() => toolStep(workflowId, call), {
-        name: `tool-${call.toolCallId}`,
-      });
-      // Feed the tool result back to the model on the next turn.
-      turnMessages.push({
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: call.toolCallId,
-            toolName: call.toolName,
-            output: { type: "json", value: output as JSONValue },
-          },
-        ],
-      });
+      if (call.toolName === "handoff") {
+        // The harness intercepts handoff: switch the running agent, don't run a tool.
+        const to = String(call.input.to ?? "");
+        const reason = String(call.input.reason ?? "");
+        const from = currentAgent.name;
+        await DBOS.runStep(
+          () =>
+            emit({
+              type: EventType.AgentHandoff,
+              workflowId,
+              from,
+              to,
+              reason,
+            }),
+          { name: `handoff-${call.toolCallId}` },
+        );
+        currentAgent = agents[to] ?? currentAgent;
+        turnMessages.push(
+          toolResultMessage(call, {
+            ok: true,
+            handedOffTo: to,
+            reason: `You were delegated from ${from} to ${to} to complete the task: ${context[1].content}`,
+          }),
+        );
+      } else {
+        const output = await DBOS.runStep(() => toolStep(workflowId, call), {
+          name: `tool-${call.toolCallId}`,
+        });
+        turnMessages.push(toolResultMessage(call, output as JSONValue));
+      }
     }
     turns.push(turnMessages);
+
     step++;
   }
 

@@ -1,7 +1,6 @@
 import { generateText } from "ai";
 import type { ModelMessage } from "ai";
 import { model } from "./model";
-import { SYSTEM_PROMPT } from "./system-prompt";
 
 // Compact once the recent-turns window grows past MAX_CONTEXT_TOKENS, peeling
 // the oldest turns into the summary until it's back under KEEP_CONTEXT_TOKENS.
@@ -34,9 +33,10 @@ export function buildContext(
   task: string,
   summary: string,
   turns: ModelMessage[][],
+  systemPrompt: string,
 ): ModelMessage[] {
   const context: ModelMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt },
     { role: "user", content: task }, // the goal is pinned, never summarized away
   ];
   if (summary) {
