@@ -8,6 +8,7 @@ import { clearEventLog, ensureSchema } from "../harness/db";
 import { subscribe, history } from "../harness/bus";
 import { runAgentWorkflow } from "../harness/runtime";
 import type { ClientMessage } from "@shared/events";
+import { runSupervisorWorkflow } from "harness/supervisor";
 
 const PORT = Number(process.env.PORT ?? 8787);
 
@@ -51,9 +52,11 @@ async function main() {
       }
 
       if (message.type === "submit_task") {
-        // Start the durable workflow in the background. It reports progress via
-        // the event stream; we don't wait for the result here.
-        await DBOS.startWorkflow(runAgentWorkflow)({ input: message.input });
+        const workflow =
+          message.mode === "supervised"
+            ? runSupervisorWorkflow
+            : runAgentWorkflow;
+        await DBOS.startWorkflow(workflow)({ input: message.input });
       }
     });
 
